@@ -20,11 +20,14 @@ from torch.distributions import uniform
 class WAD2scale():
     def __init__(self, net_list, trainloader, testloader, 
                     device = 'cuda', 
+                    num_adverse = 10,
                     scale_factor = 10,
                     kappa= None, 
                     eta = None, 
                     criterion = None,
                     adv_penalty = None,
+                    penalty_coef = 3,
+                    sd_perturbation_0 = 1,
                     path='./checkpoint'):
         '''
         WAD2scale: 
@@ -50,8 +53,9 @@ class WAD2scale():
         self.net_list = []
         for net in net_list:
             self.net_list.append(net.to(device))
+        
         self.device = device
-
+        self.num_adverse = num_adverse
         self.trainloader, self.testloader = trainloader, testloader
         self.path = path
         self.scale_factor = scale_factor
@@ -60,7 +64,7 @@ class WAD2scale():
         else:
             self.kappa = kappa
         if eta == None:
-            self.eta = {'param': lambda t: 0, 'adv': lambda t : 0}
+            self.eta = {'param': lambda t: 0, 'adv': lambda t : 1/(t+1)}
         else:
             self.eta = eta   
         if criterion==None: 
@@ -73,11 +77,19 @@ class WAD2scale():
         else:
             self.adv_penalty = adv_penalty
 
+        self.penalty_coef = penalty_coef
+        self.sd_perturbation_0 =  sd_perturbation_0
         self.n_learners = len(net_list)
         self.test_acc_adv_best = 0
         self.train_loss, self.train_acc, self.train_reg = [], [], []
         self.test_loss, self.test_acc_adv, self.test_acc_clean, self.test_reg = [], [], [], []    
         self.train_times=[]
+        self._restart_weights()
+
+
+    def _restart_weights(self):
+        self.net_weights = np.ones(self.n_learners )/self.n_learners 
+        self.adv_weights = np.ones(self.num_adverse)/self.num_adverse
 
     def set_optimizer(self, optim_alg='Adam', args={'lr':1e-4}, scheduler=None, args_scheduler={}):
         '''
@@ -158,63 +170,57 @@ class WAD2scale():
         num_correct = 0
         reg, reg_term_1, norm_grad_sum  = 0, 0, 0
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
+            #   Load inputs and target and 
+            #   create copies of inputs and target (extend one rank to tensor)
+            inputs = torch.tile(inputs, (self.num_adverse ,1,1))
+            targets = torch.tile(targets, (self.num_adverse, 1, 1))
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            # create perturbed inputs
+
+            pert_inputs = inputs + torch.randn_like(inputs) * self.sd_perturbation_0
+
             # Loop for 'many' epochs or until convergence
             for k in epoch*self.scale_factor:
-            #   Load inputs and target
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-            #   Create copies of inputs and target (extend one rank to tensor)
-            #   NO LISTO ESTO!!!!
-            #   Evaluate each one of the models
                 self._optim_zeros()
-                inputs.requires_grad_()
-                outputs = self.net.train()(inputs)
-                pre_loss = self.criterion(outputs, targets) 
-            #   Calculate the average gradient (using weights) with respect to each entry and move in this direction
-                p0 = inputs.shape[0]*torch.autograd.grad(pre_loss,inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]                                    
-                # INLCUIR EVOLUCION DE LAS MUESTRAS
+                pert_inputs.requires_grad_()
+                outputs = self.net.train()(pert_inputs)
+                pre_loss = self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs ) 
+            #   Calculate the gradient with respect to each entry and move in this direction
+                p0 = torch.autograd.grad(pre_loss,pert_inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]    
+                pert_inputs += self.eta['adv'](k)*p0
+                # INCLUIR EVOLUCION DE LAS MUESTRAS
             #   Evolve weights
+                self.adv_weights *=torch.exp( self.kappa['adv'] * self.adv_weighs @ pre_loss )
+                self.adv_weights/= self.adv_weights.sum()
 
-            # Descend all networks simultaneamente
+
+            
             # Nota: necesito una nueva inicializacion
             self._optim_zeros()
-            outputs = self.net.train()(inputs)
-            loss = self.criterion(outputs, targets)
+            outputs = self.net.train()(pert_inputs)
+            loss = self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs ) 
             loss.backward()
             self._optim_step
             # Evolve weights
-            # INCLUIR EVOLUCION DE PESOS
+            self.net_weights *=torch.exp( -self.kappa['param'] * self.net_weighs @ loss )
+            self.net_weights/= self.net_weights.sum()
+
 
             # ESCRIBIR INFORMACION A MOSTRAR, IDEALMENTE CALCULAR GRADIENTES(?)
 
 
 
 
-
-
-            #BORRAR LO QUE NO SE NECESITA
-            self.optimizer.zero_grad()
-            total += targets.size(0)            
-                                    
-            p0norm = torch.linalg.norm(p0.reshape(p0.shape[0],-1), self.rstar, dim=-1)
-            # p0norm = ((p0**2).sum(dim=(1,2,3)))**0.5
-            # if epoch<=1 and batch_idx == 0:
-            #     print(pre_loss.shape,inputs.shape, targets.shape, p0.shape,p0norm.shape )
-            reg_loss = delta* p0norm.mean()
-            loss = pre_loss + reg_loss
-            loss.backward()
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            reg_term_1+= reg_loss.item() 
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            outcome = predicted.data == targets
-            num_correct += outcome.sum().item()
-            progress_bar(batch_idx, len(self.trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d) | reg_term_1: %.3f '% \
-             (train_loss/(batch_idx+1), 100.*num_correct/total, num_correct, total, reg_term_1/(batch_idx+1)  ))
+            # train_loss += loss.item()
+            # _, predicted = outputs.max(1)
+            # outcome = predicted.data == targets
+            # num_correct += outcome.sum().item()
+            # progress_bar(batch_idx, len(self.trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d) | reg_term_1: %.3f '% \
+            #  (train_loss/(batch_idx+1), 100.*num_correct/total, num_correct, total, reg_term_1/(batch_idx+1)  ))
             
-        self.train_loss.append(train_loss/(batch_idx+1))
-        self.train_acc.append(100.*num_correct/total)
-        self.train_reg.append(reg_term_1/(batch_idx+1))
+        # self.train_loss.append(train_loss/(batch_idx+1))
+        # self.train_acc.append(100.*num_correct/total)
+        # self.train_reg.append(reg_term_1/(batch_idx+1))
                 
     def test(self, epoch, num_pgd_steps=20):  
         '''
@@ -325,79 +331,4 @@ class WAD2scale():
         plt.yticks(fontsize = 14)
         plt.show()
         
-
-
-
-class OrdTwoL(OrdOneL):
-    def __init__(self, net, trainloader, testloader, device='cuda', delta = 0.2, q=1,r=2, o1 = True, o2 =  True, mod_o2 = False,
-                 path='./checkpoint'):
-        super().__init__(net, trainloader, testloader, device=device, delta = delta, q=q,r=r,
-                 path='./checkpoint')
-        self.o1=o1
-        self.o2=o2
-        self.mod_o2=mod_o2
-        
-
-    def _train(self, epoch, delta):
-        '''
-        Training the model 
-        '''
-        print('\nEpoch: %d' % epoch)
-        train_loss, total = 0, 0
-        num_correct = 0
-        reg, reg_term_1, norm_grad_sum  = 0, 0, 0
-        for batch_idx, (inputs, targets) in enumerate(self.trainloader):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            self.optimizer.zero_grad()
-            total += targets.size(0)            
-            inputs.requires_grad_()
-            outputs = self.net.train()(inputs)                        
-            pre_loss = self.criterion(outputs, targets) 
-            p0 = -1.0* inputs.shape[0]*torch.autograd.grad(pre_loss,inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]                                    
-            auxp = p0.reshape(p0.shape[0],-1)
-            p0norm = torch.linalg.norm(auxp, self.rstar, dim=-1)            
-                        
-            if self.r==1:
-                posmax = torch.argmax(auxp, dim=1)
-                auxp2 = torch.zeros_like(auxp)
-                auxp2[:,posmax]=1.
-            elif np.isinf(self.r):
-                auxp2 = torch.sign(auxp)
-            else:                
-                auxp2 = (auxp**(self.rstar-1) + 1e-7) / (p0norm[:,None]**(self.rstar-1)+1e-7)
-
-            reg_loss = 0 
-
-            if self.mod_o2:
-                auxp2 = auxp2.detach()
-                alpha = torch.autograd.grad( (auxp*auxp2).sum(dim=-1)  ,inputs,create_graph=True, grad_outputs= torch.ones_like(p0norm) )[0]            
-            elif self.o1 or self.o2:
-                alpha = torch.autograd.grad(p0norm,inputs,create_graph=True, grad_outputs= torch.ones_like(p0norm) )[0]            
-            
-            if self.o1:
-                reg_loss += delta* p0norm.mean()            
-            if self.mod_o2:
-                    reg_loss +=delta**2/2* (auxp2*alpha.reshape(p0.shape[0],-1)).mean()                                        
-            
-            loss = pre_loss + reg_loss
-            loss.backward()
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            if self.o1 or self.o2:
-                reg_term_1+= reg_loss.item() 
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            outcome = predicted.data == targets
-            num_correct += outcome.sum().item()
-            progress_bar(batch_idx, len(self.trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d) | reg_term_1: %.3f '% \
-             (train_loss/(batch_idx+1), 100.*num_correct/total, num_correct, total, reg_term_1/(batch_idx+1)  ))
-            
-        self.train_loss.append(train_loss/(batch_idx+1))
-        self.train_acc.append(100.*num_correct/total)
-        self.train_reg.append(reg_term_1/(batch_idx+1)) 
-    
-    
-
-    
-
 
