@@ -60,11 +60,11 @@ class WAD2scale():
         self.path = path
         self.scale_factor = scale_factor
         if kappa == None:
-            self.kappa = { 'param': 0, 'adv': 0   }
+            self.kappa = { 'param': 0.1, 'adv': 0.1   }
         else:
             self.kappa = kappa
         if eta == None:
-            self.eta = {'param': lambda t: 0, 'adv': lambda t : 1/(t+1)}
+            self.eta = {'param': lambda t: 0.1/(t+1), 'adv': lambda t : 1/(t+1)}
         else:
             self.eta = eta   
         if criterion==None: 
@@ -110,28 +110,28 @@ class WAD2scale():
         self.optim_list = []
         self.sched_list = []
         for i,net in enumerate(self.net_list):
-            self.optim_list.append(getattr(optim, optim_alg)(self.net.parameters(), **args))
+            self.optim_list.append(getattr(optim, optim_alg)(net.parameters(), **args))
             if not scheduler:
-                self.sched_list.append( optim.lr_scheduler.StepLR(self.optimizer[i], step_size=10**6, gamma=1))
+                self.sched_list.append( optim.lr_scheduler.StepLR(self.optim_list[i], step_size=10**6, gamma=1))
             else:
-                self.sched_list.append(getattr(optim.lr_scheduler, scheduler)(self.optimizer[i], **args_scheduler))
+                self.sched_list.append(getattr(optim.lr_scheduler, scheduler)(self.optim_list[i], **args_scheduler))
 
     def _optim_zeros(self):
-        for i,optim in self.optim_list:
+        for optim in self.optim_list:
             optim.zero_grad()
 
     def _optim_step(self):
-        for i,optim in self.optim_list:
+        for optim in self.optim_list:
             optim.step()
 
     def _sched_step(self):
-        for i, sched in self.sched_list:
+        for  sched in self.sched_list:
             sched.step()
 
 
     # Voy aquí
 
-    def train(self, epochs = 15, delta = None):
+    def train(self, epochs = 15):
         '''
         Training the network
         ================================================
@@ -140,28 +140,15 @@ class WAD2scale():
         epochs : int
             Number of epochs
         '''
-        
-        if delta == None:
-            delta = [self.delta]        
-        if len(delta)>epochs:
-           raise ValueError('Length of delta should be less than number of epochs')
-        if len(delta)==1:
-           delta = epochs * [delta[0]]
-        else:
-           d_all = epochs * [1.0]
-           d_all[:len(delta)] = list(delta[:])
-           d_all[len(delta):] = (epochs - len(delta)) * [delta[-1]]
-           delta = d_all
-
 
         for epoch in range(epochs):
             start_time = time.time()
-            self._train(epoch, delta[epoch])
+            self._train(epoch)
             self.test(epoch)
             self.scheduler.step()
             self.train_times.append(time.time()-start_time)
         
-    def _train(self, epoch, delta):
+    def _train(self, epoch):
         '''
         Training the model 
         '''
@@ -180,7 +167,7 @@ class WAD2scale():
             pert_inputs = inputs + torch.randn_like(inputs) * self.sd_perturbation_0
 
             # Loop for 'many' epochs or until convergence
-            for k in epoch*self.scale_factor:
+            for k in range(epoch*self.scale_factor):
                 self._optim_zeros()
                 pert_inputs.requires_grad_()
                 outputs = self.net.train()(pert_inputs)
