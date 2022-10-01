@@ -20,7 +20,7 @@ from torch.distributions import uniform
 class WAD2scale():
     def __init__(self, net_list, trainloader, testloader, 
                     device = 'cuda', 
-                    num_adverse = 10,
+                    num_adverse = 6,
                     scale_factor = 10,
                     kappa= None, 
                     eta = None, 
@@ -88,8 +88,8 @@ class WAD2scale():
 
 
     def _restart_weights(self):
-        self.net_weights = np.ones(self.n_learners )/self.n_learners 
-        self.adv_weights = np.ones(self.num_adverse)/self.num_adverse
+        self.net_weights = torch.ones(self.n_learners )/self.n_learners 
+        self.adv_weights = torch.ones(self.num_adverse)/self.num_adverse
 
     def set_optimizer(self, optim_alg='Adam', args={'lr':1e-4}, scheduler=None, args_scheduler={}):
         '''
@@ -140,7 +140,7 @@ class WAD2scale():
         epochs : int
             Number of epochs
         '''
-
+        self.epochs = epochs
         for epoch in range(epochs):
             start_time = time.time()
             self._train(epoch)
@@ -159,37 +159,52 @@ class WAD2scale():
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
             #   Load inputs and target and 
             #   create copies of inputs and target (extend one rank to tensor)
-            inputs = torch.tile(inputs, (self.num_adverse ,1,1))
-            targets = torch.tile(targets, (self.num_adverse, 1, 1))
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            inputs_lst = torch.tile(inputs, (self.num_adverse,1,1 ,1,1))
+            # targets_lst = torch.tile(targets, (self.num_adverse,1))
+            inputs_lst, targets = inputs_lst.to(self.device), targets.to(self.device)
+            print('Input list shape:',inputs_lst.shape, 
+                    # 'Target_list shape:',targets_lst.shape,
+                    'Inputs shape:',inputs.shape,
+                    'tagets shape:',targets.shape)
             # create perturbed inputs
-
-            pert_inputs = inputs + torch.randn_like(inputs) * self.sd_perturbation_0
-
+            pert_inputs = inputs_lst + torch.randn_like(inputs_lst) * self.sd_perturbation_0
             # Loop for 'many' epochs or until convergence
-            for k in range(epoch*self.scale_factor):
+            for k in range(int(self.epochs *self.scale_factor)):
+                print('Inner:', k, end = '|')
                 self._optim_zeros()
                 pert_inputs.requires_grad_()
-                outputs = self.net.train()(pert_inputs)
-                pre_loss = self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs ) 
+                pre_loss = torch.zeros((self.num_adverse,1))
+                for i,net in enumerate(self.net_list):
+                    for j in range(self.num_adverse):
+                        outputs = net.train()(pert_inputs[j,...])
+                        # print('outputs shape:', outputs.shape,
+                        #   'pert_inputs[j,...] shape:', pert_inputs[j,...].shape  )
+                        pre_loss[j,:] +=  ( self.net_weights[i]*( self.criterion(outputs, targets) ) - 
+                                        self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
             #   Calculate the gradient with respect to each entry and move in this direction
                 p0 = torch.autograd.grad(pre_loss,pert_inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]    
-                pert_inputs += self.eta['adv'](k)*p0
-                # INCLUIR EVOLUCION DE LAS MUESTRAS
-            #   Evolve weights
-                self.adv_weights *=torch.exp( self.kappa['adv'] * self.adv_weighs @ pre_loss )
-                self.adv_weights/= self.adv_weights.sum()
-
-
-            
-            # Nota: necesito una nueva inicializacion
+                with torch.no_grad():    
+                    pert_inputs += self.eta['adv'](k)*p0.detach()
+                    #   Evolve weights
+                    self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() )
+                    self.adv_weights/= self.adv_weights.sum()
+                print(self.adv_weights)
+   
             self._optim_zeros()
-            outputs = self.net.train()(pert_inputs)
-            loss = self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs ) 
-            loss.backward()
-            self._optim_step
+            loss = torch.zeros(self.n_learners)
+            for i,net in enumerate(self.net_list):
+                for j in range(self.num_adverse):
+                    # print('i,j:',i,j)
+                    outputs = net.train()(pert_inputs[j,...])
+                    loss[i] +=  self.adv_weights[j] * (  self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...] ) )
+            
+            loss.sum().backward()
+            self._optim_step()
+
+
+            #self._optim_step()
             # Evolve weights
-            self.net_weights *=torch.exp( -self.kappa['param'] * self.net_weighs @ loss )
+            self.net_weights *=torch.exp( -self.kappa['param'] * loss )
             self.net_weights/= self.net_weights.sum()
 
 
