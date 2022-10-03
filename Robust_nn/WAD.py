@@ -188,8 +188,7 @@ class WAD2scale():
                     #   Evolve weights
                     self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() )
                     self.adv_weights/= self.adv_weights.sum()
-                print(self.adv_weights)
-   
+            print(self.adv_weights)
             self._optim_zeros()
             loss = torch.zeros(self.n_learners)
             for i,net in enumerate(self.net_list):
