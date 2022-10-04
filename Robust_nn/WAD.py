@@ -14,11 +14,14 @@ import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.optim.lr_scheduler import StepLR
 from torch.distributions import uniform
+from torch.optim.swa_utils import AveragedModel, SWALR
 
 
 
 class WAD2scale():
-    def __init__(self, net_list, trainloader, testloader, 
+    def __init__(self, net_list, 
+                    avg_nets,
+                    trainloader, testloader, 
                     device = 'cuda', 
                     num_adverse = 6,
                     scale_factor = 10,
@@ -35,15 +38,22 @@ class WAD2scale():
         Arguments:
 
         net_list: List of PyTorch nn network structures
+        avg_nets: 
         trainloader: PyTorch Dataloader
         testloader: PyTorch Dataloader
-        device: 'cpu' or 'cuda' if GPU available
-            type of decide to move tensors
-
-
-
+        device: 'cpu' or 'cuda' if GPU available type  to move tensors
+        num_adverse: number of adversarial samples
+        scale_factor: ratio of adversarial sample epoch per model epoch
+        kappa= dictionary with constants for kappa for both 'adv' and 'param'
+        eta =  dictionary with functions for eta for both 'adv' and 'param'
+        criterion = Criterion for the function to minimise
+        adv_penalty = Criterion for the pnealty for adversaruals
+        penalty_coef = Coefficient in fornt of penalty of adversarials
+        sd_perturbation_0 = standard deviation for Gaussian perturbation of initial data
         path: string
             path to save the best model
+
+        Note: the total objective is top find min max criterion(x_tilde, y; nu) - adv_penalty*(x,x_tilde)
         
         '''      
 
@@ -54,6 +64,11 @@ class WAD2scale():
         for net in net_list:
             self.net_list.append(net.to(device))
         
+        self.avg_nets= []
+        for net in avg_nets:
+            self.avg_nets.append(net.to(device))
+        
+
         self.device = device
         self.num_adverse = num_adverse
         self.trainloader, self.testloader = trainloader, testloader
@@ -124,12 +139,19 @@ class WAD2scale():
         for optim in self.optim_list:
             optim.step()
 
+    def _avg_model_update(self):
+        for i,net in self.net_list:
+            self.avg_nets[i].update_parameters(net)
+
     def _sched_step(self):
         for  sched in self.sched_list:
             sched.step()
 
-
-    # Voy aquí
+    def predict(self,x):
+        outputs = []
+        for i, model in enumerate(self.avg_nets):
+            outputs.append( self.net_weights[i]* model()(x))
+        return sum(outputs)
 
     def train(self, epochs = 15):
         '''
@@ -142,34 +164,38 @@ class WAD2scale():
         '''
         self.epochs = epochs
         for epoch in range(epochs):
+            print('\nEpoch: %d' % epoch)
             start_time = time.time()
             self._train(epoch)
-            self.test(epoch)
+            #Calculate 'epoch average of the model'
+            self._avg_model_update()
+            # self.test(epoch)
             self.scheduler.step()
             self.train_times.append(time.time()-start_time)
+            
         
     def _train(self, epoch):
         '''
         Training the model 
         '''
-        print('\nEpoch: %d' % epoch)
-        train_loss, total = 0, 0
-        num_correct = 0
-        reg, reg_term_1, norm_grad_sum  = 0, 0, 0
+
+        # train_loss, total = 0, 0
+        # num_correct = 0
+        # reg, reg_term_1, norm_grad_sum  = 0, 0, 0
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
             #   Load inputs and target and 
             #   create copies of inputs and target (extend one rank to tensor)
             inputs_lst = torch.tile(inputs, (self.num_adverse,1,1 ,1,1))
             # targets_lst = torch.tile(targets, (self.num_adverse,1))
             inputs_lst, targets = inputs_lst.to(self.device), targets.to(self.device)
-            print('Input list shape:',inputs_lst.shape, 
-                    # 'Target_list shape:',targets_lst.shape,
-                    'Inputs shape:',inputs.shape,
-                    'tagets shape:',targets.shape)
+            # print('Input list shape:',inputs_lst.shape, 
+            #         # 'Target_list shape:',targets_lst.shape,
+            #         'Inputs shape:',inputs.shape,
+            #         'tagets shape:',targets.shape)
             # create perturbed inputs
             pert_inputs = inputs_lst + torch.randn_like(inputs_lst) * self.sd_perturbation_0
             # Loop for 'many' epochs or until convergence
-            for k in range(int(self.epochs *self.scale_factor)):
+            for k in range(self.scale_factor):
                 print('Inner:', k, end = '|')
                 self._optim_zeros()
                 pert_inputs.requires_grad_()
@@ -199,8 +225,8 @@ class WAD2scale():
             
             loss.sum().backward()
             self._optim_step()
-
-
+            
+            
             #self._optim_step()
             # Evolve weights
             self.net_weights *=torch.exp( -self.kappa['param'] * loss )
