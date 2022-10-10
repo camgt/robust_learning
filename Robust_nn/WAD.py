@@ -24,6 +24,7 @@ class WAD2scale():
                     trainloader, testloader, 
                     device = 'cuda', 
                     num_adverse = 6,
+                    num_adverse_avg = 24,
                     scale_factor = 10,
                     kappa= None, 
                     eta = None, 
@@ -31,6 +32,7 @@ class WAD2scale():
                     adv_penalty = None,
                     penalty_coef = 3,
                     sd_perturbation_0 = 1,
+                    max_batches = 10,
                     path='./checkpoint'):
         '''
         WAD2scale: 
@@ -50,6 +52,7 @@ class WAD2scale():
         adv_penalty = Criterion for the pnealty for adversaruals
         penalty_coef = Coefficient in fornt of penalty of adversarials
         sd_perturbation_0 = standard deviation for Gaussian perturbation of initial data
+        max_batches: maximum number of batches
         path: string
             path to save the best model
 
@@ -68,7 +71,7 @@ class WAD2scale():
         for net in avg_nets:
             self.avg_nets.append(net.to(device))
         
-
+        self.max_batches = max_batches
         self.device = device
         self.num_adverse = num_adverse
         self.trainloader, self.testloader = trainloader, testloader
@@ -100,11 +103,27 @@ class WAD2scale():
         self.test_loss, self.test_acc_adv, self.test_acc_clean, self.test_reg = [], [], [], []    
         self.train_times=[]
         self._restart_weights()
+        self._restart_adv()
+        
+
+
+    def _restart_adv(self):
+        self.adv_samples={ 'original': [], 'adverse':[], 'weights':[],'labels': []  }
+        self.avg_adv_samples={ 'original': [], 'adverse':[], 'weights':[],'labels': []  }
 
 
     def _restart_weights(self):
-        self.net_weights = torch.ones(self.n_learners )/self.n_learners 
-        self.adv_weights = torch.ones(self.num_adverse)/self.num_adverse
+        self.net_weights = (torch.ones(self.n_learners )/self.n_learners).to(self.device)
+        self.adv_weights = (torch.ones(self.num_adverse)/self.num_adverse).to(self.device)
+
+
+    def _save_adv_samples(self, path):
+        torch.save((self.adv_samples,self.avg_adv_samples),path)
+
+
+    def _load_adv_samples(self,path):
+        self.adv_samples, self.avg_adv_samples = torch.load(path)
+
 
     def set_optimizer(self, optim_alg='Adam', args={'lr':1e-4}, scheduler=None, args_scheduler={}):
         '''
@@ -140,7 +159,7 @@ class WAD2scale():
             optim.step()
 
     def _avg_model_update(self):
-        for i,net in self.net_list:
+        for i,net in enumerate(self.net_list):
             self.avg_nets[i].update_parameters(net)
 
     def _sched_step(self):
@@ -150,7 +169,7 @@ class WAD2scale():
     def predict(self,x):
         outputs = []
         for i, model in enumerate(self.avg_nets):
-            outputs.append( self.net_weights[i]* model()(x))
+            outputs.append( self.net_weights[i]* model(x))
         return sum(outputs)
 
     def train(self, epochs = 15):
@@ -166,14 +185,55 @@ class WAD2scale():
         for epoch in range(epochs):
             print('\nEpoch: %d' % epoch)
             start_time = time.time()
+            print(self.adv_weights)
+            print(self.net_weights)
             self._train(epoch)
             #Calculate 'epoch average of the model'
             self._avg_model_update()
             # self.test(epoch)
-            self.scheduler.step()
+            self._sched_step()
             self.train_times.append(time.time()-start_time)
             
+    def _sample_no_rep(self, weights, n):
+        '''
+        samples n elements from a list of probabilities. Returns a tuple of 
+        positions and weights. Requires n<len(weights), a dummy position is returnes
+        together with possibly zero entries.
+        =======================
+        Arguments:
+
+        '''
+
         
+        n_weights = len(weights)
+        if n_weights >= n:
+            pos_out = np.random.choice(n_weights, n, replace = False, p=weights.detach().numpy() )
+            w_out = copy.deepcopy(weights)[pos_out]
+            w_out/= w_out.sum()
+        else:
+            pos_out = np.zeros(n)
+            pos_out[:n_weights] = np.arange(n_weights)
+            w_out = torch.zeros(n)
+            w_out[:n_weights] = copy.deepcopy(weights)
+        return w_out, torch.from_numpy(pos_out)
+
+
+
+
+
+    def _update_avg_adverse (self, time):
+        '''
+        calculate the running time average of distributions
+        '''
+
+
+
+        
+
+
+
+
+
     def _train(self, epoch):
         '''
         Training the model 
@@ -185,6 +245,9 @@ class WAD2scale():
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
             #   Load inputs and target and 
             #   create copies of inputs and target (extend one rank to tensor)
+            if batch_idx > self.max_batches:
+                break
+            print(batch_idx, end='|')
             inputs_lst = torch.tile(inputs, (self.num_adverse,1,1 ,1,1))
             # targets_lst = torch.tile(targets, (self.num_adverse,1))
             inputs_lst, targets = inputs_lst.to(self.device), targets.to(self.device)
@@ -193,10 +256,10 @@ class WAD2scale():
             #         'Inputs shape:',inputs.shape,
             #         'tagets shape:',targets.shape)
             # create perturbed inputs
-            pert_inputs = inputs_lst + torch.randn_like(inputs_lst) * self.sd_perturbation_0
+            pert_inputs = inputs_lst + torch.randn_like(inputs_lst).to(self.device) * self.sd_perturbation_0
             # Loop for 'many' epochs or until convergence
             for k in range(self.scale_factor):
-                print('Inner:', k, end = '|')
+                # print('Inner:', k, end = '|')
                 self._optim_zeros()
                 pert_inputs.requires_grad_()
                 pre_loss = torch.zeros((self.num_adverse,1))
@@ -212,9 +275,12 @@ class WAD2scale():
                 with torch.no_grad():    
                     pert_inputs += self.eta['adv'](k)*p0.detach()
                     #   Evolve weights
-                    self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() )
+                    self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() ).to(self.device)
                     self.adv_weights/= self.adv_weights.sum()
-            print(self.adv_weights)
+            
+            # Keep last version of adversarial images in memory
+            self.adv_samples = copy.deepcopy(pert_inputs)
+
             self._optim_zeros()
             loss = torch.zeros(self.n_learners)
             for i,net in enumerate(self.net_list):
@@ -232,7 +298,7 @@ class WAD2scale():
             self.net_weights *=torch.exp( -self.kappa['param'] * loss )
             self.net_weights/= self.net_weights.sum()
 
-
+            
             # ESCRIBIR INFORMACION A MOSTRAR, IDEALMENTE CALCULAR GRADIENTES(?)
 
 
@@ -256,9 +322,8 @@ class WAD2scale():
         test_loss, adv_acc, total, reg, clean_acc, grad_sum = 0, 0, 0, 0, 0, 0
 
         for batch_idx, (inputs, targets) in enumerate(self.testloader):
-
             inputs, targets = inputs.to(self.device), targets.to(self.device)
-            outputs = self.net.eval()(inputs)
+            outputs = self.predict(inputs)
             loss = self.criterion(outputs, targets)
             test_loss += loss.item()
             _, predicted = outputs.max(1)
@@ -267,11 +332,12 @@ class WAD2scale():
 
             inputs_pert = inputs + 0.
             eps = 5./255.*8
-            r = pgd(inputs, self.net.eval(), epsilon=[eps], targets=targets, step_size=0.04,
+            i_rand = np.random.randint(0, self.n_learners)
+            r = pgd(inputs, self.net_list[i_rand].eval(), epsilon=[eps], targets=targets, step_size=0.04,
                     num_steps=num_pgd_steps, epsil=eps)
 
             inputs_pert = inputs_pert + eps * torch.Tensor(r).to(self.device)
-            outputs = self.net(inputs_pert)
+            outputs = self.predict(inputs_pert)
             probs, predicted = outputs.max(1)
             adv_acc += predicted.eq(targets).sum().item()
           
@@ -293,7 +359,7 @@ class WAD2scale():
 
     def save_model(self, path):
         '''
-        Saving the model
+        Saving models and adversarial samples
         ================================================
         Arguments:
 
@@ -302,22 +368,45 @@ class WAD2scale():
         '''
         
         print('Saving...')
+        
+        state = {}
+        for i, net in enumerate(self.net_list):
+            state['net_state_'+str(i)] = net.state_dict()
+            state['optim_state_'+str(i)] = self.optim_list[i].state_dict()
+            state['avg_net_state_'+str(i)] = self.avg_nets[i].state_dict()
+        
+        state['adv_samples'] = self.adv_samples
+        state['avg_adv_samples'] = self.avg_adv_samples
 
-        state = {
-            'net': self.net.state_dict(),
-            'optimizer': self.optimizer.state_dict()
-        }
+
         torch.save(state, path)
-
+        print('done.')
     
 
 
     def import_model(self, path):
         '''
         Importing the pre-trained model
+        ==============================
+        Arguments:
+
+        path: string
+            path to where model is saved
         '''
+        
+        print('Loading...')
         checkpoint = torch.load(path)
-        self.net.load_state_dict(checkpoint['net'])
+
+        for i, net in enumerate(self.net_list):
+            net.load_state_dict(checkpoint['net_state_'+str(i)])
+            self.optim_list[i].load_state_dict(checkpoint['optim_state_'+str(i)])
+            self.avg_nets[i].load_state_dict(checkpoint['avg_net_state_'+str(i)])
+        
+        self.adv_samples = checkpoint['adv_samples']
+        self.avg_adv_samples = checkpoint['avg_adv_samples'] 
+
+        print('done.')  
+            
            
             
     def plot_results(self):
