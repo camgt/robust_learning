@@ -71,6 +71,7 @@ class WAD2scale():
         for net in avg_nets:
             self.avg_nets.append(net.to(device))
         
+        self.num_adverse_avg = num_adverse_avg
         self.max_batches = max_batches
         self.device = device
         self.num_adverse = num_adverse
@@ -104,7 +105,8 @@ class WAD2scale():
         self.train_times=[]
         self._restart_weights()
         self._restart_adv()
-        
+        self.n_avg_models = len(avg_nets)
+        self.avg_net_weights = (torch.ones( self.n_avg_models )/self.n_avg_models).to(self.device)
 
 
     def _restart_adv(self):
@@ -158,9 +160,6 @@ class WAD2scale():
         for optim in self.optim_list:
             optim.step()
 
-    def _avg_model_update(self):
-        for i,net in enumerate(self.net_list):
-            self.avg_nets[i].update_parameters(net)
 
     def _sched_step(self):
         for  sched in self.sched_list:
@@ -171,6 +170,57 @@ class WAD2scale():
         for i, model in enumerate(self.avg_nets):
             outputs.append( self.net_weights[i]* model(x))
         return sum(outputs)
+
+            
+    def _sample_no_rep(self, weights, n):
+        '''
+        samples n elements from a list of probabilities. Returns a tuple of 
+        positions and weights. Requires n<len(weights), a dummy position is returnes
+        together with possibly zero entries.
+        =======================
+        Arguments:
+
+        '''
+        
+        n_weights = len(weights)
+        if n_weights >= n:
+            pos_out = np.random.choice(n_weights, n, replace = False, p=weights.detach().numpy() )
+            w_out = copy.deepcopy(weights)[pos_out]
+            w_out/= w_out.sum()
+        else:
+            pos_out = np.zeros(n)
+            pos_out[:n_weights] = np.arange(n_weights)
+            w_out = torch.zeros(n)
+            w_out[:n_weights] = copy.deepcopy(weights)
+        return w_out, torch.from_numpy(pos_out)
+
+
+    def _update_avg_adverse (self, time):
+        '''
+        calculate the running time average of adversarial distributions
+        '''
+
+        weights_all = [w*(time/(time+1)) for w in self.avg_adv_samples['weights']] + [w/time for w in self.adv_samples['weights']]
+        adverse_all = self.avg_adv_samples['adverse'] + self.adv_samples['adverse']
+
+        self.avg_adv_samples['weights'], aux = self._sample_no_rep(weights_all,self.num_adverse_avg)
+        self.avg_adv_samples['adverse'] = copy.deepcopy(adverse_all[aux])
+
+
+    def _update_avg_model (self, time):
+        '''
+        calculate the running time average of model distributions
+        '''    
+        weights_all = torch.cat( ( (time/(time+1))* self.avg_net_weights, (1/(time+1))*self.net_weights),0)
+        model_all =  self.avg_nets + self.net_list
+        
+        self.avg_net_weights, aux = self._sample_no_rep(weights_all, self.n_avg_models)
+        self.avg_nets = copy.deepcopy(model_all[aux])
+
+    # def _avg_model_update(self):
+    #     for i,net in enumerate(self.net_list):
+    #         self.avg_nets[i].update_parameters(net)
+
 
     def train(self, epochs = 15):
         '''
@@ -189,47 +239,11 @@ class WAD2scale():
             print(self.net_weights)
             self._train(epoch)
             #Calculate 'epoch average of the model'
-            self._avg_model_update()
             # self.test(epoch)
             self._sched_step()
+            self._update_avg_model(epoch)
+            self._update_avg_adverse(epoch)
             self.train_times.append(time.time()-start_time)
-            
-    def _sample_no_rep(self, weights, n):
-        '''
-        samples n elements from a list of probabilities. Returns a tuple of 
-        positions and weights. Requires n<len(weights), a dummy position is returnes
-        together with possibly zero entries.
-        =======================
-        Arguments:
-
-        '''
-
-        
-        n_weights = len(weights)
-        if n_weights >= n:
-            pos_out = np.random.choice(n_weights, n, replace = False, p=weights.detach().numpy() )
-            w_out = copy.deepcopy(weights)[pos_out]
-            w_out/= w_out.sum()
-        else:
-            pos_out = np.zeros(n)
-            pos_out[:n_weights] = np.arange(n_weights)
-            w_out = torch.zeros(n)
-            w_out[:n_weights] = copy.deepcopy(weights)
-        return w_out, torch.from_numpy(pos_out)
-
-
-
-
-
-    def _update_avg_adverse (self, time):
-        '''
-        calculate the running time average of distributions
-        '''
-
-
-
-        
-
 
 
 
