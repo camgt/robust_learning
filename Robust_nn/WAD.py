@@ -110,6 +110,7 @@ class WAD2scale():
 
 
     def _restart_adv(self):
+        self._new_adv = True
         self.adv_samples={ 'original': [], 'adverse':[], 'weights':[],'labels': []  }
         self.avg_adv_samples={ 'original': [], 'adverse':[], 'weights':[],'labels': []  }
 
@@ -181,30 +182,42 @@ class WAD2scale():
         Arguments:
 
         '''
-        
-        n_weights = len(weights)
+
+        if torch.is_tensor(weights):
+            weights_ = weights.detach().numpy()
+            n_weights = (weights_>0).sum()
+                
+
         if n_weights >= n:
-            pos_out = np.random.choice(n_weights, n, replace = False, p=weights.detach().numpy() )
-            w_out = copy.deepcopy(weights)[pos_out]
+            pos_out = np.random.choice(n_weights, n, replace = False, p=weights_[weights_>0] )
+            w_out = weights.detach().clone()[weights>0][pos_out]
             w_out/= w_out.sum()
         else:
-            pos_out = np.zeros(n)
+            pos_out = np.zeros(n, dtype= np.int_ )
             pos_out[:n_weights] = np.arange(n_weights)
             w_out = torch.zeros(n)
-            w_out[:n_weights] = copy.deepcopy(weights)
-        return w_out, torch.from_numpy(pos_out)
+            w_out[:n_weights] = weights[weights>0].detach().clone()
+        return w_out, pos_out #torch.from_numpy(pos_out)
 
 
     def _update_avg_adverse (self, time):
         '''
         calculate the running time average of adversarial distributions
         '''
+        # print('\n length of weights:',len(self.avg_adv_samples['weights']))
+        # print(self.avg_adv_samples['weights'])
+        # print(self.adv_samples['weights'])
 
-        weights_all = [w*(time/(time+1)) for w in self.avg_adv_samples['weights']] + [w/time for w in self.adv_samples['weights']]
-        adverse_all = self.avg_adv_samples['adverse'] + self.adv_samples['adverse']
-
-        self.avg_adv_samples['weights'], aux = self._sample_no_rep(weights_all,self.num_adverse_avg)
-        self.avg_adv_samples['adverse'] = copy.deepcopy(adverse_all[aux])
+        if self._new_adv:
+            self.avg_adv_samples = copy.deepcopy(self.adv_samples)
+        else:
+            for i, advs in enumerate(self.avg_adv_samples['adverse']):
+                
+                weights_all = torch.cat( ( (time/(time+1))* self.avg_adv_samples['weights'][i], (1/(time+1))*self.adv_samples['weights'][i]),0)
+                # weights_all = [w*(time/(time+1)) for w in self.avg_adv_samples['weights'][i]] + [w/time for w in self.adv_samples['weights'][i]]
+                adverse_all = torch.cat((advs,self.adv_samples['adverse'][i]),0)
+                self.avg_adv_samples['weights'][i], aux = self._sample_no_rep(weights_all,self.num_adverse_avg)
+                self.avg_adv_samples['adverse'][i] = adverse_all[aux].detach().clone()
 
 
     def _update_avg_model (self, time):
@@ -215,7 +228,11 @@ class WAD2scale():
         model_all =  self.avg_nets + self.net_list
         
         self.avg_net_weights, aux = self._sample_no_rep(weights_all, self.n_avg_models)
-        self.avg_nets = copy.deepcopy(model_all[aux])
+        # print('\n aux',aux.shape, aux.type())
+        # print('model_all', model_all.shape)
+        self.avg_nets = [ copy.deepcopy(model_all[i]) for i in aux]
+        
+        # copy.deepcopy(model_all[aux])
 
     # def _avg_model_update(self):
     #     for i,net in enumerate(self.net_list):
@@ -242,8 +259,9 @@ class WAD2scale():
             # self.test(epoch)
             self._sched_step()
             self._update_avg_model(epoch)
-            self._update_avg_adverse(epoch)
             self.train_times.append(time.time()-start_time)
+            self._new_adv = False
+
 
 
 
@@ -263,14 +281,21 @@ class WAD2scale():
                 break
             print(batch_idx, end='|')
             inputs_lst = torch.tile(inputs, (self.num_adverse,1,1 ,1,1))
+            
             # targets_lst = torch.tile(targets, (self.num_adverse,1))
             inputs_lst, targets = inputs_lst.to(self.device), targets.to(self.device)
-            # print('Input list shape:',inputs_lst.shape, 
-            #         # 'Target_list shape:',targets_lst.shape,
-            #         'Inputs shape:',inputs.shape,
-            #         'tagets shape:',targets.shape)
-            # create perturbed inputs
-            pert_inputs = inputs_lst + torch.randn_like(inputs_lst).to(self.device) * self.sd_perturbation_0
+
+            if self._new_adv:
+                # create perturbed inputs and set adversarial weights and values
+                self.adv_weights = self.adv_weights = (torch.ones(self.num_adverse)/self.num_adverse).to(self.device)
+                pert_inputs = inputs_lst + torch.randn_like(inputs_lst).to(self.device) * self.sd_perturbation_0
+            else:
+                #Load adversarial weights and values
+                self.adv_weights = copy.deepcopy(self.adv_samples['weights'][batch_idx])
+                pert_inputs =  copy.deepcopy(self.adv_samples['adverse'][batch_idx])
+    
+
+               
             # Loop for 'many' epochs or until convergence
             for k in range(self.scale_factor):
                 # print('Inner:', k, end = '|')
@@ -293,7 +318,17 @@ class WAD2scale():
                     self.adv_weights/= self.adv_weights.sum()
             
             # Keep last version of adversarial images in memory
-            self.adv_samples = copy.deepcopy(pert_inputs)
+            if self._new_adv:
+                self.adv_samples['original'].append(copy.deepcopy(inputs))
+                self.adv_samples['labels'].append(copy.deepcopy(targets))
+                self.adv_samples['adverse'].append(copy.deepcopy(pert_inputs.detach()))
+                self.adv_samples['weights'].append(self.adv_weights)
+            else:
+                self.adv_samples['adverse'][batch_idx] = copy.deepcopy(pert_inputs)
+                self.adv_samples['weights'][batch_idx] = self.adv_weights
+            
+            self._update_avg_adverse(epoch)
+
 
             self._optim_zeros()
             loss = torch.zeros(self.n_learners)
