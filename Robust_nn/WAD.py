@@ -33,6 +33,7 @@ class WAD2scale():
                     penalty_coef = 3,
                     sd_perturbation_0 = 1,
                     max_batches = 10,
+                    tolerance_adv = 1e-5,
                     path='./checkpoint'):
         '''
         WAD2scale: 
@@ -107,7 +108,7 @@ class WAD2scale():
         self._restart_adv()
         self.n_avg_models = len(avg_nets)
         self.avg_net_weights = (torch.ones( self.n_avg_models )/self.n_avg_models).to(self.device)
-
+        self.tolerance_adv = tolerance_adv
 
     def _restart_adv(self):
         self._new_adv = True
@@ -183,9 +184,9 @@ class WAD2scale():
 
         '''
 
-        if torch.is_tensor(weights):
-            weights_ = weights.detach().numpy()
-            n_weights = (weights_>0).sum()
+        
+        weights_ = weights.detach().numpy()
+        n_weights = (weights_>0).sum()
                 
 
         if n_weights >= n:
@@ -311,8 +312,13 @@ class WAD2scale():
                                         self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
             #   Calculate the gradient with respect to each entry and move in this direction
                 p0 = torch.autograd.grad(pre_loss,pert_inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]    
+
+                if torch.max(p0.detach())< self.tolerance_adv:
+                    break
+
                 with torch.no_grad():    
-                    pert_inputs += self.eta['adv'](k)*p0.detach()
+                    # Evolve adversarial and project weithin its space (assuming images described by normalised floats)
+                    pert_inputs = torch.clip(pert_inputs + self.eta['adv'](k)*p0.detach(),0,1)
                     #   Evolve weights
                     self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() ).to(self.device)
                     self.adv_weights/= self.adv_weights.sum()
@@ -340,9 +346,7 @@ class WAD2scale():
             
             loss.sum().backward()
             self._optim_step()
-            
-            
-            #self._optim_step()
+                       
             # Evolve weights
             self.net_weights *=torch.exp( -self.kappa['param'] * loss )
             self.net_weights/= self.net_weights.sum()
@@ -350,24 +354,98 @@ class WAD2scale():
             
             # ESCRIBIR INFORMACION A MOSTRAR, IDEALMENTE CALCULAR GRADIENTES(?)
 
-
-
-
-            # train_loss += loss.item()
-            # _, predicted = outputs.max(1)
-            # outcome = predicted.data == targets
-            # num_correct += outcome.sum().item()
-            # progress_bar(batch_idx, len(self.trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d) | reg_term_1: %.3f '% \
-            #  (train_loss/(batch_idx+1), 100.*num_correct/total, num_correct, total, reg_term_1/(batch_idx+1)  ))
-            
-        # self.train_loss.append(train_loss/(batch_idx+1))
-        # self.train_acc.append(100.*num_correct/total)
-        # self.train_reg.append(reg_term_1/(batch_idx+1))
+     
                 
     def test(self, epoch, num_pgd_steps=20):  
         '''
         Testing the model 
+
+        Peform the following tests:
+        1. Test for accuracy of the average  model
+        2. Train directly the model with the whole set of adversaries. Calculate...
+        3. Create directly the adversarial. 
+
         '''
+
+         
+
+        # Train directly the model with set of average adversaries
+
+        for batch_idx, adv_struct in enumerate(self.avg_adv_samples):
+#######
+            print(batch_idx, end='|')
+            
+            inputs = adv_struct['original']
+            pert_inputs = adv_struct['adverse']
+            targets = adv_struct['labels']    
+               
+            # Calculate the loss function for the average model with the averag
+
+            loss = 
+
+            # Loop for 'many' epochs or until convergence
+            for k in range(self.scale_factor):
+                # print('Inner:', k, end = '|')
+                self._optim_zeros()
+                pert_inputs.requires_grad_()
+                pre_loss = torch.zeros((self.num_adverse,1))
+                for i,net in enumerate(self.net_list):
+                    for j in range(self.num_adverse):
+                        outputs = net.train()(pert_inputs[j,...])
+                        # print('outputs shape:', outputs.shape,
+                        #   'pert_inputs[j,...] shape:', pert_inputs[j,...].shape  )
+                        pre_loss[j,:] +=  ( self.net_weights[i]*( self.criterion(outputs, targets) ) - 
+                                        self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
+            #   Calculate the gradient with respect to each entry and move in this direction
+                p0 = torch.autograd.grad(pre_loss,pert_inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]    
+
+                if torch.max(p0.detach())< self.tolerance_adv:
+                    break
+
+                with torch.no_grad():    
+                    # Evolve adversarial and project weithin its space (assuming images described by normalised floats)
+                    pert_inputs = torch.clip(pert_inputs + self.eta['adv'](k)*p0.detach(),0,1)
+                    #   Evolve weights
+                    self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() ).to(self.device)
+                    self.adv_weights/= self.adv_weights.sum()
+            
+            # Keep last version of adversarial images in memory
+            if self._new_adv:
+                self.adv_samples['original'].append(copy.deepcopy(inputs))
+                self.adv_samples['labels'].append(copy.deepcopy(targets))
+                self.adv_samples['adverse'].append(copy.deepcopy(pert_inputs.detach()))
+                self.adv_samples['weights'].append(self.adv_weights)
+            else:
+                self.adv_samples['adverse'][batch_idx] = copy.deepcopy(pert_inputs)
+                self.adv_samples['weights'][batch_idx] = self.adv_weights
+            
+            self._update_avg_adverse(epoch)
+
+
+            self._optim_zeros()
+            loss = torch.zeros(self.n_learners)
+            for i,net in enumerate(self.net_list):
+                for j in range(self.num_adverse):
+                    # print('i,j:',i,j)
+                    outputs = net.train()(pert_inputs[j,...])
+                    loss[i] +=  self.adv_weights[j] * (  self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...] ) )
+            
+            loss.sum().backward()
+            self._optim_step()
+                       
+            # Evolve weights
+            self.net_weights *=torch.exp( -self.kappa['param'] * loss )
+            self.net_weights/= self.net_weights.sum()
+
+
+
+
+###########
+
+
+
+
+
         test_loss, adv_acc, total, reg, clean_acc, grad_sum = 0, 0, 0, 0, 0, 0
 
         for batch_idx, (inputs, targets) in enumerate(self.testloader):
