@@ -144,24 +144,53 @@ class WAD2scale():
         args_scheduler : dict
             Parameters of the scheduler
         '''
-
+        self.optim_alg = optim_alg
         self.optim_list = []
         self.sched_list = []
         for i,net in enumerate(self.net_list):
-            self.optim_list.append(getattr(optim, optim_alg)(net.parameters(), **args))
+            self.optim_list.append(getattr(optim, optim_alg)(net.parameters(), **args))          
             if not scheduler:
                 self.sched_list.append( optim.lr_scheduler.StepLR(self.optim_list[i], step_size=10**6, gamma=1))
             else:
                 self.sched_list.append(getattr(optim.lr_scheduler, scheduler)(self.optim_list[i], **args_scheduler))
 
+    def set_optimizer_avg(self, args={'lr':1e-4}, scheduler=None, args_scheduler={}):
+        '''
+        Setting the optimizer of the list of network. The same optimizer and schedule is assumed
+        ================================================
+        Arguments:
+        
+        optim_alg : string
+            Name of the optimizer
+        args: dict
+            Parameter of the optimizer
+        scheduler: optim.lr_scheduler
+            Learning rate scheduler
+        args_scheduler : dict
+            Parameters of the scheduler
+        '''
+        self.optim_list_avg = []
+        self.sched_list_avg = []
+        for i,net in enumerate(self.avg_nets):
+            self.optim_list_avg.append(getattr(optim, self.optim_alg )(net.parameters(), **args))          
+            if not scheduler:
+                self.sched_list_avg.append( optim.lr_scheduler.StepLR(self.optim_list_avg[i], step_size=10**6, gamma=1))
+            else:
+                self.sched_list_avg.append(getattr(optim.lr_scheduler, scheduler)(self.optim_list_avg[i], **args_scheduler))
+
     def _optim_zeros(self):
         for optim in self.optim_list:
+            optim.zero_grad()
+    def _optim_zeros_avg(self):
+        for optim in self.optim_list_avg:
             optim.zero_grad()
 
     def _optim_step(self):
         for optim in self.optim_list:
             optim.step()
-
+    def _optim_step_avg(self):
+        for optim in self.optim_list_avg:
+            optim.step()
 
     def _sched_step(self):
         for  sched in self.sched_list:
@@ -170,7 +199,7 @@ class WAD2scale():
     def predict(self,x):
         outputs = []
         for i, model in enumerate(self.avg_nets):
-            outputs.append( self.net_weights[i]* model(x))
+            outputs.append( self.avg_net_weights[i]* model(x))
         return sum(outputs)
 
             
@@ -264,9 +293,6 @@ class WAD2scale():
             self._new_adv = False
 
 
-
-
-
     def _train(self, epoch):
         '''
         Training the model 
@@ -285,6 +311,7 @@ class WAD2scale():
             
             # targets_lst = torch.tile(targets, (self.num_adverse,1))
             inputs_lst, targets = inputs_lst.to(self.device), targets.to(self.device)
+            inputs = inputs.to(self.device)
 
             if self._new_adv:
                 # create perturbed inputs and set adversarial weights and values
@@ -292,22 +319,23 @@ class WAD2scale():
                 pert_inputs = inputs_lst + torch.randn_like(inputs_lst).to(self.device) * self.sd_perturbation_0
             else:
                 #Load adversarial weights and values
-                self.adv_weights = copy.deepcopy(self.adv_samples['weights'][batch_idx])
-                pert_inputs =  copy.deepcopy(self.adv_samples['adverse'][batch_idx])
+                self.adv_weights = copy.deepcopy(self.adv_samples['weights'][batch_idx]).to(self.device)
+                pert_inputs =  copy.deepcopy(self.adv_samples['adverse'][batch_idx]).to(self.device)
     
-
                
             # Loop for 'many' epochs or until convergence
             for k in range(self.scale_factor):
                 # print('Inner:', k, end = '|')
                 self._optim_zeros()
                 pert_inputs.requires_grad_()
-                pre_loss = torch.zeros((self.num_adverse,1))
+                pre_loss = torch.zeros((self.num_adverse,1)).to(self.device)
                 for i,net in enumerate(self.net_list):
                     for j in range(self.num_adverse):
                         outputs = net.train()(pert_inputs[j,...])
                         # print('outputs shape:', outputs.shape,
                         #   'pert_inputs[j,...] shape:', pert_inputs[j,...].shape  )
+                        # print(self.net_weights[i].device, outputs.device, targets.device, 
+                                # inputs.device, pert_inputs.device )
                         pre_loss[j,:] +=  ( self.net_weights[i]*( self.criterion(outputs, targets) ) - 
                                         self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
             #   Calculate the gradient with respect to each entry and move in this direction
@@ -354,97 +382,99 @@ class WAD2scale():
             
             # ESCRIBIR INFORMACION A MOSTRAR, IDEALMENTE CALCULAR GRADIENTES(?)
 
-     
+    def _compute_loss_avg (self, n_adv, n_samples, net_list, adv_weights, inputs, pert_inputs, targets):
+        avg_loss = torch.zeros((n_adv ,1))
+        for i,net in enumerate(net_list):
+            for j, img in enumerate(n_adv):
+                outputs = net.train()(pert_inputs[j,...])
+                # print('outputs shape:', outputs.shape,
+                #   'pert_inputs[j,...] shape:', pert_inputs[j,...].shape  )
+                avg_loss[j,:] += adv_weights[j]* ( self.avg_net_weights[i]*( self.criterion(outputs, targets) ) - 
+                                self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
+        
+        return avg_loss.mean()
                 
-    def test(self, epoch, num_pgd_steps=20):  
+    def test(self, inner_epochs, num_pgd_steps=5):  
         '''
         Testing the model 
 
         Peform the following tests:
-        1. Test for accuracy of the average  model
         2. Train directly the model with the whole set of adversaries. Calculate...
         3. Create directly the adversarial. 
 
         '''
 
-         
+        # Calculate the loss of the average model with the average adversarial
+        self.set_optimizer_avg()
+        avg_loss = 0
+        avg_loss_net = 0
+        avg_loss_adv = 0
+        
+        copy_net_list = copy.deepcopy(self.avg_nets).to(self.device)
+        copy_adv_samples = copy.deepcopy(self.avg_adv_samples).to(self.device)
 
-        # Train directly the model with set of average adversaries
 
-        for batch_idx, adv_struct in enumerate(self.avg_adv_samples):
-#######
-            print(batch_idx, end='|')
-            
-            inputs = adv_struct['original']
-            pert_inputs = adv_struct['adverse']
-            targets = adv_struct['labels']    
-               
+        for batch_idx, inputs in enumerate(self.avg_adv_samples['original']):
+
+            print(batch_idx, end='|')          
+            pert_inputs = self.avg_adv_samples['adverse'][batch_idx]
+            pert_inputs_cpy = self.copy_adv_samples['adverse'][batch_idx]
+            targets = self.avg_adv_samples['labels'][batch_idx]    
+            adv_weights = self.avg_adv_samples['weights'][batch_idx]
+
+            pert_inputs.copy()
+
+            n_nets = len(self.avg_nets)
+            n_adv = pert_inputs.shape[0]        
             # Calculate the loss function for the average model with the averag
+            n_samples = pert_inputs.shape[1]
 
-            loss = 
 
-            # Loop for 'many' epochs or until convergence
-            for k in range(self.scale_factor):
-                # print('Inner:', k, end = '|')
-                self._optim_zeros()
-                pert_inputs.requires_grad_()
-                pre_loss = torch.zeros((self.num_adverse,1))
-                for i,net in enumerate(self.net_list):
-                    for j in range(self.num_adverse):
-                        outputs = net.train()(pert_inputs[j,...])
-                        # print('outputs shape:', outputs.shape,
-                        #   'pert_inputs[j,...] shape:', pert_inputs[j,...].shape  )
-                        pre_loss[j,:] +=  ( self.net_weights[i]*( self.criterion(outputs, targets) ) - 
-                                        self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
-            #   Calculate the gradient with respect to each entry and move in this direction
-                p0 = torch.autograd.grad(pre_loss,pert_inputs,create_graph=True, grad_outputs=torch.ones_like(pre_loss))[0]    
+            avg_loss +=  self._compute_loss_avg (n_adv, n_samples, self.avg_nets, 
+                                                self.avg_nets, adv_weights, inputs, 
+                                                pert_inputs, targets)
+            
 
-                if torch.max(p0.detach())< self.tolerance_adv:
-                    break
+            # Train the model with set of average adversaries and calculate the new loss
+            avg_loss_net_xtra = 0
+            avg_loss_adv_xtra = 0
+            pert_inputs_cpy.requires_grad_() 
+            for k in range(inner_epochs):
+                self._optim_zeros_avg()                
+                loss_net += self._compute_loss_avg (self, n_adv, n_samples, 
+                                                            copy_net_list, adv_weights, 
+                                                            inputs, pert_inputs, 
+                                                            targets)
+                avg_loss_net_xtra+= loss_net.item()
+                loss_net.mean().backward()
+                self._optim_step_avg()
 
+                loss_adv += self._compute_loss_avg (self, n_adv, n_samples, 
+                                                            self.avg_nets, adv_weights, 
+                                                            inputs, pert_inputs_cpy, 
+                                                            targets)
+
+          
+                p0 = torch.autograd.grad(loss_adv,pert_inputs_cpy,create_graph=True, grad_outputs=torch.ones_like(loss_adv))[0]    
                 with torch.no_grad():    
                     # Evolve adversarial and project weithin its space (assuming images described by normalised floats)
-                    pert_inputs = torch.clip(pert_inputs + self.eta['adv'](k)*p0.detach(),0,1)
-                    #   Evolve weights
-                    self.adv_weights *=torch.exp( self.kappa['adv'] * pre_loss.squeeze() ).to(self.device)
-                    self.adv_weights/= self.adv_weights.sum()
-            
-            # Keep last version of adversarial images in memory
-            if self._new_adv:
-                self.adv_samples['original'].append(copy.deepcopy(inputs))
-                self.adv_samples['labels'].append(copy.deepcopy(targets))
-                self.adv_samples['adverse'].append(copy.deepcopy(pert_inputs.detach()))
-                self.adv_samples['weights'].append(self.adv_weights)
-            else:
-                self.adv_samples['adverse'][batch_idx] = copy.deepcopy(pert_inputs)
-                self.adv_samples['weights'][batch_idx] = self.adv_weights
-            
-            self._update_avg_adverse(epoch)
+                    pert_inputs_cpy = torch.clip(pert_inputs_cpy + self.eta['adv'](k)*p0.detach(),0,1)
+                    
+                avg_loss_adv_xtra+= loss_adv.item()
 
+            avg_loss_net += avg_loss_net_xtra
+            avg_loss_adv += avg_loss_adv_xtra
 
-            self._optim_zeros()
-            loss = torch.zeros(self.n_learners)
-            for i,net in enumerate(self.net_list):
-                for j in range(self.num_adverse):
-                    # print('i,j:',i,j)
-                    outputs = net.train()(pert_inputs[j,...])
-                    loss[i] +=  self.adv_weights[j] * (  self.criterion(outputs, targets) -  self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...] ) )
-            
-            loss.sum().backward()
-            self._optim_step()
-                       
-            # Evolve weights
-            self.net_weights *=torch.exp( -self.kappa['param'] * loss )
-            self.net_weights/= self.net_weights.sum()
-
-
-
+        print('Loss of time-average model and adversaries', avg_loss)
+        print('Proxy for loss fixing model and optimizing adversaries', avg_loss_adv)
+        print('Proxy for loss fixing model and optimizing adversaries', avg_loss_net)
+        
+        return avg_loss, avg_loss_adv, avg_loss_net
+        
 
 ###########
 
-
-
-
+    def test_pgd(self, epoch, num_pgd_steps=5):  
 
         test_loss, adv_acc, total, reg, clean_acc, grad_sum = 0, 0, 0, 0, 0, 0
 
@@ -460,7 +490,7 @@ class WAD2scale():
             inputs_pert = inputs + 0.
             eps = 5./255.*8
             i_rand = np.random.randint(0, self.n_learners)
-            r = pgd(inputs, self.net_list[i_rand].eval(), epsilon=[eps], targets=targets, step_size=0.04,
+            r = pgd(inputs, self.net_list[i_rand], epsilon=[eps], targets=targets, step_size=0.04,
                     num_steps=num_pgd_steps, epsil=eps)
 
             inputs_pert = inputs_pert + eps * torch.Tensor(r).to(self.device)

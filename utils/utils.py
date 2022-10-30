@@ -44,7 +44,7 @@ def read_vision_dataset(path, batch_size=128, num_workers=4, dataset='CIFAR10', 
     
     return trainloader, testloader
 
-def pgd(inputs, net, epsilon=[1.], targets=None, step_size=0.04, num_steps=20, epsil=5./255.*8):
+def pgd(inputs, net, epsilon=[1.], targets=None, step_size=0.04, num_steps=20, epsil=5./255.*8, device = None):
 
     """
        :param image: Image of size HxWx3
@@ -56,16 +56,23 @@ def pgd(inputs, net, epsilon=[1.], targets=None, step_size=0.04, num_steps=20, e
        perturbed image
     """
     input_shape = inputs.shape
-    pert_image = inputs.clone().to('cuda:0')
+    pert_image = inputs.clone()
     w = torch.zeros(input_shape)
     r_tot = torch.zeros(input_shape)
-    
+
     # denormal = transforms.Compose([transforms.Normalize((0., 0., 0.), (1/0.2023, 1/0.1994, 1/0.2010)),
     #                          transforms.Normalize((-0.4914, -0.4822, -0.4465), (1., 1., 1.))])                                   
     # normal = transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
 
-    pert_image = pert_image + (torch.rand(inputs.shape).to('cuda:0')-0.5)*2*epsil
-    pert_image = pert_image.to('cuda:0')
+    pert_image = pert_image + (torch.rand(inputs.shape).to(pert_image.device)-0.5)*2*epsil
+
+    if device:
+        net = net.to(device)
+        pert_image = pert_image.to(device)
+        targets = targets.to(device)
+
+
+
     
     for ii in range(num_steps):
         pert_image.requires_grad_()    
@@ -86,7 +93,7 @@ def pgd(inputs, net, epsilon=[1.], targets=None, step_size=0.04, num_steps=20, e
     
     r_tot = pert_image - inputs
     regul = np.linalg.norm(r_tot.cpu().flatten(start_dim=1, end_dim=-1), np.inf, axis=1)
-    regul = torch.Tensor(regul).view(-1,1,1,1).cuda()
+    regul = torch.Tensor(regul).view(-1,1,1,1).to(device)
     r_tot = r_tot / regul
     
     return r_tot.cpu()
