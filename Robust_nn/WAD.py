@@ -15,13 +15,18 @@ import torch.backends.cudnn as cudnn
 from torch.optim.lr_scheduler import StepLR
 from torch.distributions import uniform
 from torch.optim.swa_utils import AveragedModel, SWALR
+from torch.utils.data import Dataset, DataLoader
 
-
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
 
 class WAD2scale():
     def __init__(self, net_list, 
                     avg_nets,
-                    trainloader, testloader, 
+                    dataset_name,
+                    batch_size,
+                    transforms = None,
+                    num_workers=4, 
                     device = 'cuda', 
                     num_adverse = 6,
                     num_adverse_avg = 24,
@@ -61,8 +66,13 @@ class WAD2scale():
         
         '''      
 
+
+        self._AVG_ADV_FOLDER = '_avg_adv_folder'
+
         if not torch.cuda.is_available() and device=='cuda':
             raise ValueError("cuda is not available")
+
+
 
         self.net_list = []
         for net in net_list:
@@ -76,8 +86,10 @@ class WAD2scale():
         self.max_batches = max_batches
         self.device = device
         self.num_adverse = num_adverse
-        self.trainloader, self.testloader = trainloader, testloader
         self.path = path
+
+        self._set_dataloaders(dataset_name,transforms,batch_size,num_workers)
+
         self.scale_factor = scale_factor
         if kappa == None:
             self.kappa = { 'param': 0.1, 'adv': 0.1   }
@@ -212,12 +224,8 @@ class WAD2scale():
         Arguments:
 
         '''
-
-        
         weights_ = weights.detach().numpy()
         n_weights = (weights_>0).sum()
-                
-
         if n_weights >= n:
             pos_out = np.random.choice(n_weights, n, replace = False, p=weights_[weights_>0] )
             w_out = weights.detach().clone()[weights>0][pos_out]
@@ -256,17 +264,68 @@ class WAD2scale():
         '''    
         weights_all = torch.cat( ( (time/(time+1))* self.avg_net_weights, (1/(time+1))*self.net_weights),0)
         model_all =  self.avg_nets + self.net_list
-        
         self.avg_net_weights, aux = self._sample_no_rep(weights_all, self.n_avg_models)
         # print('\n aux',aux.shape, aux.type())
         # print('model_all', model_all.shape)
         self.avg_nets = [ copy.deepcopy(model_all[i]) for i in aux]
-        
         # copy.deepcopy(model_all[aux])
 
     # def _avg_model_update(self):
     #     for i,net in enumerate(self.net_list):
     #         self.avg_nets[i].update_parameters(net)
+
+
+    def _set_dataloaders(self, dataset, transform, batch_size, num_workers ):
+        path = '../data'
+        if not transform and dataset=='CIFAR10':
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            ])
+        if not transform and dataset=='MNIST':
+            transform = transforms.ToTensor()            
+    
+            
+        trainset = getattr(datasets,dataset)(root=path, train=True, download=True, transform=transform)
+        trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        testset = getattr(datasets,dataset)(root=path, train=False, download=True, transform=transform)
+        testloader = DataLoader(testset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        
+        self.dataset_name = dataset
+        self.dataset_transform = transform
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.trainloader, self.testloader = trainloader, testloader
+
+
+    def _save_avg_adv_samples(self):
+        for idx, w in enumerate(self.avg_adv_samples['weights']):
+            torch.save(w,f"./{self._AVG_ADV_FOLDER}/weights/tensor{idx}.pt")
+            torch.save(self.avg_adv_samples['adverse'][idx],f"./{self._AVG_ADV_FOLDER}/adverse/tensor{idx}.pt")    
+        class AdvDataset(Dataset):
+            def __init__(self, img_folder, weights_folder):
+                self.imgs = os.listdir(img_folder)
+                self.weights = os.listdir(weights_folder)
+                self.img_folder = img_folder
+                self.weights_folder = weights_folder
+            def __len__(self):
+                return len(self.imgs)
+            def __getitem__(self, idx):
+                return (torch.load(f"{self.img_folder}/{self.imgs[idx]}"),torch.load(f"{self.weights_folder}/{self.weights[idx]}"))
+
+        self.adv_dataset = AdvDataset( os.path.join('.',self._AVG_ADV_FOLDER,'adverse') , 
+                                        os.path.join('.',self._AVG_ADV_FOLDER,'weights')   )
+        
+        self.adv_dataloader = DataLoader(self.adv_dataset, batch_size=self.batch_size, 
+                                        shuffle=False, num_workers=self.num_workers)
+
+        self.avg_adv_samples['adverse']=[]
+        self.avg_adv_samples['weights']=[]
+
+    def _load_avg_adverse(self, idx):
+
+        return (torch.load(f"{self.adv_dataset.img_folder}/{self.adv_dataset.imgs[idx]}"),
+                torch.load(f"{self.adv_dataset.weights_folder}/{self.adv_dataset.weights[idx]}"))
 
 
     def train(self, epochs = 15):
@@ -291,7 +350,7 @@ class WAD2scale():
             self._update_avg_model(epoch)
             self.train_times.append(time.time()-start_time)
             self._new_adv = False
-
+        self._save_avg_adv_samples()
 
     def _train(self, epoch):
         '''
@@ -307,15 +366,16 @@ class WAD2scale():
             if batch_idx > self.max_batches:
                 break
             print(batch_idx, end='|')
-            inputs_lst = torch.tile(inputs, (self.num_adverse,1,1 ,1,1))
-            
+        
             # targets_lst = torch.tile(targets, (self.num_adverse,1))
-            inputs_lst, targets = inputs_lst.to(self.device), targets.to(self.device)
-            inputs = inputs.to(self.device)
+             
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
 
             if self._new_adv:
                 # create perturbed inputs and set adversarial weights and values
-                self.adv_weights = self.adv_weights = (torch.ones(self.num_adverse)/self.num_adverse).to(self.device)
+                inputs_lst = torch.tile(inputs, (self.num_adverse,1,1 ,1,1))
+                inputs_lst = inputs_lst.to(self.device)
+                self.adv_weights = (torch.ones(self.num_adverse)/self.num_adverse).to(self.device)
                 pert_inputs = inputs_lst + torch.randn_like(inputs_lst).to(self.device) * self.sd_perturbation_0
             else:
                 #Load adversarial weights and values
@@ -353,12 +413,12 @@ class WAD2scale():
             
             # Keep last version of adversarial images in memory
             if self._new_adv:
-                self.adv_samples['original'].append(copy.deepcopy(inputs))
-                self.adv_samples['labels'].append(copy.deepcopy(targets))
+                # self.adv_samples['original'].append(copy.deepcopy(inputs))
+                # self.adv_samples['labels'].append(copy.deepcopy(targets))
                 self.adv_samples['adverse'].append(copy.deepcopy(pert_inputs.detach()))
                 self.adv_samples['weights'].append(self.adv_weights)
             else:
-                self.adv_samples['adverse'][batch_idx] = copy.deepcopy(pert_inputs)
+                self.adv_samples['adverse'][batch_idx] = copy.deepcopy(pert_inputs.detach())
                 self.adv_samples['weights'][batch_idx] = self.adv_weights
             
             self._update_avg_adverse(epoch)
@@ -382,18 +442,108 @@ class WAD2scale():
             
             # ESCRIBIR INFORMACION A MOSTRAR, IDEALMENTE CALCULAR GRADIENTES(?)
 
-    def _compute_loss_avg (self, n_adv, n_samples, net_list, adv_weights, inputs, pert_inputs, targets):
+    def _compute_loss_avg (self, n_adv, n_samples, net_list, adv_weights, inputs, pert_inputs, targets, input_grad=False):
+        
+        if input_grad:
+            pert_inputs.requires_grad_() 
+
         avg_loss = torch.zeros((n_adv ,1))
+
         for i,net in enumerate(net_list):
-            for j, img in enumerate(n_adv):
+            for j in range(n_adv):
                 outputs = net.train()(pert_inputs[j,...])
                 # print('outputs shape:', outputs.shape,
                 #   'pert_inputs[j,...] shape:', pert_inputs[j,...].shape  )
                 avg_loss[j,:] += adv_weights[j]* ( self.avg_net_weights[i]*( self.criterion(outputs, targets) ) - 
                                 self.penalty_coef * self.adv_penalty(inputs, pert_inputs[j,...]) )
-        
+        if input_grad:
+            return avg_loss.mean(), torch.autograd.grad(avg_loss.mean(),pert_inputs,create_graph=True, grad_outputs=torch.ones_like(avg_loss.mean()))[0]
+
         return avg_loss.mean()
+
+
+    def test_base (self):
+        
+        avg_loss = 0
+        for batch_idx, (inputs, targets) in enumerate(self.trainloader):
+            pert_inputs, adv_weights = self._load_avg_adverse(self, batch_idx)                
+            n_nets = len(self.avg_nets)
+            n_adv = pert_inputs.shape[0]        
+            # Calculate the loss function for the average model with the averag
+            n_samples = pert_inputs.shape[1]
+
+            avg_loss +=  self._compute_loss_avg (n_adv, n_samples, self.avg_nets, 
+                                                adv_weights, inputs, 
+                                                pert_inputs, targets)
+
+        print('Loss of time-average model and adversaries', avg_loss)
+        return avg_loss
+
+
+    def test_improve_model (self, inner_epochs):
+        self.set_optimizer_avg()
+        avg_loss = 0
+        for batch_idx, (inputs, targets) in enumerate(self.trainloader):
+            if batch_idx > self.max_batches:
+                break
+            print(batch_idx,end = '|')
+            pert_inputs, adv_weights = self._load_avg_adverse(batch_idx)                
+            n_nets = len(self.avg_nets)
+            n_adv = pert_inputs.shape[0]        
+            # Calculate the loss function for the average model with the averag
+            n_samples = pert_inputs.shape[1]
+            copy_nets =  copy.deepcopy(self.avg_nets)
+
+           # Train the model with set of average adversaries and calculate the new loss
+            avg_loss_net_xtra = 0
+            for k in range(inner_epochs):
+                self._optim_zeros_avg()                
+                loss_net = self._compute_loss_avg ( n_adv, n_samples, 
+                                                            self.avg_nets, adv_weights, 
+                                                            inputs, pert_inputs, 
+                                                            targets)
+                avg_loss_net_xtra+= loss_net.item()
+                loss_net.mean().backward()
+                self._optim_step_avg()
                 
+            avg_loss += avg_loss_net_xtra
+
+        self.avg_nets = copy_nets
+        print('Loss of time-average after training model with available adversaries', avg_loss)
+        return avg_loss
+
+
+    def test_improve_adversaries (self, inner_epochs):
+        avg_loss = 0
+        for batch_idx, (inputs, targets) in enumerate(self.trainloader):
+            if batch_idx > self.max_batches:
+                break
+            pert_inputs, adv_weights = self._load_avg_adverse(batch_idx)                
+            n_nets = len(self.avg_nets)
+            n_adv = pert_inputs.shape[0]        
+            # Calculate the loss function for the average model with the averag
+            n_samples = pert_inputs.shape[1]
+            copy_inputs =  copy.deepcopy(pert_inputs)
+            # Train the model with set of average adversaries and calculate the new loss
+            avg_loss_adv_xtra = 0
+            # copy_inputs.requires_grad_() 
+            for k in range(inner_epochs):
+                self._optim_zeros_avg()                
+                loss_adv, p0 = self._compute_loss_avg (n_adv, n_samples, 
+                                                            self.avg_nets, adv_weights, 
+                                                            inputs, copy_inputs, 
+                                                            targets, input_grad=True)
+             
+                # p0 = torch.autograd.grad(loss_adv,copy_inputs,create_graph=True, grad_outputs=torch.ones_like(loss_adv))[0]    
+                with torch.no_grad():    
+                    # Evolve adversarial and project weithin its space (assuming images described by normalised floats)
+                    copy_inputs = torch.clip(copy_inputs + self.eta['adv'](k)*p0.detach(),0,1)
+                avg_loss_adv_xtra+= loss_adv.item()
+            avg_loss += avg_loss_adv_xtra
+
+        print('Loss of time-average after training model with available adversaries', avg_loss)
+        return avg_loss
+
     def test(self, inner_epochs, num_pgd_steps=5):  
         '''
         Testing the model 
@@ -410,19 +560,17 @@ class WAD2scale():
         avg_loss_net = 0
         avg_loss_adv = 0
         
-        copy_net_list = copy.deepcopy(self.avg_nets).to(self.device)
-        copy_adv_samples = copy.deepcopy(self.avg_adv_samples).to(self.device)
+        copy_net_list = copy.deepcopy(self.avg_nets)
+        copy_adv_samples = copy.deepcopy(self.avg_adv_samples)
 
 
         for batch_idx, inputs in enumerate(self.avg_adv_samples['original']):
 
             print(batch_idx, end='|')          
             pert_inputs = self.avg_adv_samples['adverse'][batch_idx]
-            pert_inputs_cpy = self.copy_adv_samples['adverse'][batch_idx]
+            pert_inputs_cpy = copy_adv_samples['adverse'][batch_idx]
             targets = self.avg_adv_samples['labels'][batch_idx]    
             adv_weights = self.avg_adv_samples['weights'][batch_idx]
-
-            pert_inputs.copy()
 
             n_nets = len(self.avg_nets)
             n_adv = pert_inputs.shape[0]        
@@ -431,9 +579,10 @@ class WAD2scale():
 
 
             avg_loss +=  self._compute_loss_avg (n_adv, n_samples, self.avg_nets, 
-                                                self.avg_nets, adv_weights, inputs, 
+                                                adv_weights, inputs, 
                                                 pert_inputs, targets)
             
+
 
             # Train the model with set of average adversaries and calculate the new loss
             avg_loss_net_xtra = 0
@@ -442,7 +591,7 @@ class WAD2scale():
             for k in range(inner_epochs):
                 self._optim_zeros_avg()                
                 loss_net += self._compute_loss_avg (self, n_adv, n_samples, 
-                                                            copy_net_list, adv_weights, 
+                                                            self.avg_nets, adv_weights, 
                                                             inputs, pert_inputs, 
                                                             targets)
                 avg_loss_net_xtra+= loss_net.item()
@@ -450,7 +599,7 @@ class WAD2scale():
                 self._optim_step_avg()
 
                 loss_adv += self._compute_loss_avg (self, n_adv, n_samples, 
-                                                            self.avg_nets, adv_weights, 
+                                                            copy_net_list, adv_weights, 
                                                             inputs, pert_inputs_cpy, 
                                                             targets)
 
@@ -464,11 +613,11 @@ class WAD2scale():
 
             avg_loss_net += avg_loss_net_xtra
             avg_loss_adv += avg_loss_adv_xtra
-
-        print('Loss of time-average model and adversaries', avg_loss)
+        self.avg_nets = copy_net_list
+   
         print('Proxy for loss fixing model and optimizing adversaries', avg_loss_adv)
         print('Proxy for loss fixing model and optimizing adversaries', avg_loss_net)
-        
+    
         return avg_loss, avg_loss_adv, avg_loss_net
         
 
@@ -512,7 +661,7 @@ class WAD2scale():
         return test_loss/(batch_idx+1), 100.*adv_acc/total, 100.*clean_acc/total
 
     
-
+    
 
     def save_model(self, path):
         '''
@@ -535,10 +684,20 @@ class WAD2scale():
         state['adv_samples'] = self.adv_samples
         state['avg_adv_samples'] = self.avg_adv_samples
 
+        # state['dataset_name'] = self.dataset_name
+        # state['batch_size']=self.batch_size
+        # state['kappa'] = self.kappa
+        # state['eta'] = self.eta
+        # state['penalty_coef'] = self.penalty_coef
+        # state['max_batches'] = self.max_batches
 
         torch.save(state, path)
         print('done.')
     
+
+
+
+
 
 
     def import_model(self, path):
@@ -561,6 +720,14 @@ class WAD2scale():
         
         self.adv_samples = checkpoint['adv_samples']
         self.avg_adv_samples = checkpoint['avg_adv_samples'] 
+
+        # self.dataset_name = checkpoint['dataset_name'] 
+        # self.batch_size = checkpoint['batch_size']
+        # self.kappa = checkpoint['kappa'] 
+        # self.eta = checkpoint['eta'] 
+        # self.penalty_coef = checkpoint['penalty_coef'] 
+        # self.max_batches = checkpoint['max_batches'] 
+
 
         print('done.')  
             
@@ -603,5 +770,33 @@ class WAD2scale():
         plt.xticks(fontsize = 14)
         plt.yticks(fontsize = 14)
         plt.show()
-        
 
+
+if __name__ == '__main__':
+    pass
+
+# if __name__ == '__main__':
+#     from utils.convnet import ConvNet
+
+#     n_nets = 2
+#     net_lst = [ConvNet() for i in range(n_nets)]
+#     avg_nets =[ConvNet() for i in range(n_nets*4)]
+
+#     # adv_net = WAD2scale(net_list = net_lst, avg_nets = avg_nets, 
+#     #                     dataset_name='MNIST',batch_size = 1024, 
+#     #                     device = None , criterion= nn.CrossEntropyLoss(), 
+#     #                     scale_factor=5, num_adverse=2,
+#     #                     kappa = { 'param': 0.2, 'adv': 0.2   },
+#     #                     max_batches= 5)
+
+
+#     adv_net = WAD2scale(net_list = net_lst, avg_nets = avg_nets, 
+#                         dataset_name='MNIST',batch_size = 128, 
+#                         device = None , criterion= nn.CrossEntropyLoss(), 
+#                         scale_factor=2, num_adverse=2,
+#                         kappa = { 'param': 0.2, 'adv': 0.2   },
+#                         max_batches= 2)
+
+#     adv_net.set_optimizer()
+#     adv_net.import_model('Test1_kappa0p2-4')
+#     adv_net.test_improve_model(5)
