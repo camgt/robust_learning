@@ -36,7 +36,7 @@ class WAD2scale():
                     dataset_name,
                     batch_size,
                     transforms = None,
-                    num_workers=4, 
+                    num_workers=1, 
                     device = 'cuda', 
                     num_adverse = 6,
                     num_adverse_avg = 24,
@@ -111,7 +111,7 @@ class WAD2scale():
         else:
             self.kappa = kappa
         if eta == None:
-            self.eta = {'param': lambda t: 0.1/(t+1), 'adv': lambda t : 1/(t+1)}
+            self.eta = {'param': lambda t: 0.1/(t+1), 'adv': lambda t : 0.1/(t+1)}
         else:
             self.eta = eta   
         if criterion==None: 
@@ -358,14 +358,15 @@ class WAD2scale():
         self.avg_adv_samples['weights']=[]
 
     def _load_avg_adverse(self, idx):
+        # torch.save(w,f"./{self._AVG_ADV_FOLDER}/weights/tensor{idx}.pt")
 
-        img_folder =  os.path.join('.',self._AVG_ADV_FOLDER,'adverse')
-        weights_folder = os.path.join('.',self._AVG_ADV_FOLDER,'weights')
-        imgs = os.listdir(img_folder)
-        weights = os.listdir(weights_folder)
+        img_folder =  os.path.join('.',self._AVG_ADV_FOLDER,'adverse','tensor')
+        weights_folder = os.path.join('.',self._AVG_ADV_FOLDER,'weights','tensor')
+        # imgs = os.listdir(img_folder)
+        # weights = os.listdir(weights_folder)
 
-        return (torch.load(f"{img_folder}/{imgs[idx]}"),
-                torch.load(f"{weights_folder}/{weights[idx]}"))
+        return (torch.load(f"{img_folder}{idx}.pt"),
+                torch.load(f"{weights_folder}{idx}.pt"))
 
 
     def train(self, epochs = 15):
@@ -381,8 +382,8 @@ class WAD2scale():
         for epoch in range(epochs):
             print('\nEpoch: %d' % epoch)
             start_time = time.time()
-            print(self.adv_weights)
-            print(self.net_weights)
+            # print(self.adv_weights)
+            # print(self.net_weights)
             self._train(epoch)
             #Calculate 'epoch average of the model'
             # self.test(epoch)
@@ -403,10 +404,13 @@ class WAD2scale():
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
             #   Load inputs and target and 
             #   create copies of inputs and target (extend one rank to tensor)
-            if batch_idx > self.max_batches:
+            
+            if batch_idx >= self.max_batches:
                 break
+            if batch_idx % 30 ==0:
+                print(' ')
             print(batch_idx, end='|')
-        
+            
             # targets_lst = torch.tile(targets, (self.num_adverse,1))
              
             inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -482,7 +486,7 @@ class WAD2scale():
             
             # ESCRIBIR INFORMACION A MOSTRAR, IDEALMENTE CALCULAR GRADIENTES(?)
 
-    def _compute_loss_avg (self, n_adv, n_samples, net_list, adv_weights, inputs, pert_inputs, targets, input_grad=False):
+    def _compute_loss_avg (self, n_adv, net_list, adv_weights, inputs, pert_inputs, targets, input_grad=False):
         
         if input_grad:
             pert_inputs.requires_grad_() 
@@ -506,18 +510,28 @@ class WAD2scale():
         
         avg_loss = 0
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
-            if batch_idx > self.max_batches:
+            if batch_idx >= self.max_batches:
                 break
+            if batch_idx % 30 ==0:
+                print(' ')
             print(batch_idx, end='|')
-            pert_inputs, adv_weights = self._load_avg_adverse(batch_idx)                
-            n_nets = len(self.avg_nets)
+            pert_inputs, adv_weights = self._load_avg_adverse(batch_idx)   
+           
+            # print(pert_inputs.shape, adv_weights.shape, inputs.shape, targets.shape)
             n_adv = pert_inputs.shape[0]        
             # Calculate the loss function for the average model with the averag
-            n_samples = pert_inputs.shape[1]
+            # n_samples = pert_inputs.shape[1]
 
-            avg_loss +=  self._compute_loss_avg (n_adv, n_samples, self.avg_nets, 
-                                                adv_weights, inputs, 
-                                                pert_inputs, targets).item()
+            avg_loss +=  self._compute_loss_avg (n_adv, self.avg_nets, 
+                                                adv_weights.detach(), inputs.detach(), 
+                                                pert_inputs.detach(), targets.detach()).item()
+            # if batch_idx<1:
+            #     plt.imshow(pert_inputs[0][0][0])
+            #     plt.figure()
+            #     plt.imshow(pert_inputs[1][0][0])
+            #     plt.figure()
+            #     plt.imshow(inputs[0][0])
+            #     print(avg_loss)
 
         print('\nLoss of time-average model and adversaries', avg_loss)
         return avg_loss
@@ -527,11 +541,13 @@ class WAD2scale():
         self.set_optimizer_avg()
         avg_loss = 0
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
-            if batch_idx > self.max_batches:
+            if batch_idx >= self.max_batches:
                 break
-            print(batch_idx,end = '|')
+            if batch_idx % 30 ==0:
+                print(' ')
+            print(batch_idx, end='|')
             pert_inputs, adv_weights = self._load_avg_adverse(batch_idx)                
-            n_nets = len(self.avg_nets)
+            # n_nets = len(self.avg_nets)
             n_adv = pert_inputs.shape[0]       
           
             # Calculate the loss function for the average model with the averag
@@ -546,9 +562,9 @@ class WAD2scale():
                 # print('[',k,']', end='-')
                 self._optim_zeros_avg()   
 
-                loss_net =  self._compute_loss_avg (n_adv, n_samples, self.avg_nets, 
-                                                adv_weights.detach(), inputs, 
-                                                pert_inputs, targets)
+                loss_net =  self._compute_loss_avg (n_adv, self.avg_nets, 
+                                                adv_weights.detach(), inputs.detach(), 
+                                                pert_inputs.detach(), targets.detach())
 
 
                 # loss_net = torch.zeros(n_adv)
@@ -574,11 +590,13 @@ class WAD2scale():
         # self.set_optimizer_avg()
         avg_loss = 0
         for batch_idx, (inputs, targets) in enumerate(self.trainloader):
-            if batch_idx > self.max_batches:
+            if batch_idx >= self.max_batches:
                 break
+            if batch_idx % 30 ==0:
+                print(' ')
             print(batch_idx, end='|')
             pert_inputs, adv_weights = self._load_avg_adverse(batch_idx)                
-            n_nets = len(self.avg_nets)
+            # n_nets = len(self.avg_nets)
             n_adv = pert_inputs.shape[0]        
             # Calculate the loss function for the average model with the averag
             n_samples = pert_inputs.shape[1]
@@ -588,8 +606,7 @@ class WAD2scale():
             # copy_inputs.requires_grad_() 
             for k in range(inner_epochs):
                 # self._optim_zeros_avg()                
-                loss_adv, p0 = self._compute_loss_avg (n_adv, n_samples, 
-                                                            self.avg_nets, adv_weights, 
+                loss_adv, p0 = self._compute_loss_avg (n_adv, self.avg_nets, adv_weights.detach(), 
                                                             inputs, copy_inputs, 
                                                             targets, input_grad=True)
              
