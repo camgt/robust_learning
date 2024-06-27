@@ -1,0 +1,10 @@
+| Metric | Value |
+| ------ | ----- |
+| clean_accuracy_timeAvg | 94.75 |
+| PGD_accuracy_timeAvg | 53.96 |
+| rel_change_adv_timeAvg | 0.001904095058100852 |
+| rel_change_model_timeAvg | 0.0048308931378080455 |
+| clean_accuracy_resample | 92.81 |
+| PGD_accuracy_resample | 52.83 |
+| rel_change_adv_resample | 0.000260006332112539 |
+| rel_change_model_resample | 0.038033973427126 |
