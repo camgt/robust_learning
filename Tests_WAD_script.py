@@ -60,7 +60,11 @@ if __name__ == '__main__':
         Testing of the models as in the paper. Outputs are written in a markdown file: 'results.md'.
     '''
     
-    
+    torch.manual_seed(0)
+    import random
+    random.seed(0)
+    import numpy as np
+    np.random.seed(0)
     
     # %%
     # Define parameters of test
